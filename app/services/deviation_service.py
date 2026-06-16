@@ -261,12 +261,14 @@ class DeviationDetectionService:
     def process_all_unprocessed(
         cls,
         db: Session,
-    ) -> Dict[str, int]:
+    ) -> Dict:
         from app.services.snapshot_service import SnapshotSyncService
+        from app.services.ticket_service import TicketService
 
         snapshots = SnapshotSyncService.get_unprocessed_snapshots(db)
         total_deviations = 0
         high_risk_count = 0
+        failed_snapshots = 0
 
         for snapshot in snapshots:
             try:
@@ -275,12 +277,18 @@ class DeviationDetectionService:
                 high_risk_count += len([d for d in deviations if d.risk_level == "high"])
             except Exception as e:
                 logger.error(f"处理快照#{snapshot.id}失败: {str(e)}")
+                failed_snapshots += 1
                 continue
+
+        new_tickets = TicketService.auto_generate_tickets(db)
+        new_ticket_count = len(new_tickets)
 
         result = {
             "processed_snapshots": len(snapshots),
+            "failed_snapshots": failed_snapshots,
             "total_deviations": total_deviations,
             "high_risk_count": high_risk_count,
+            "new_ticket_count": new_ticket_count,
         }
         logger.info(f"批量偏离检测完成: {result}")
         return result
@@ -293,20 +301,17 @@ class DeviationDetectionService:
         action_type: str,
         operator_name: str,
         remarks: Optional[str] = None,
-    ) -> Optional[PermissionDeviation]:
+    ) -> Tuple[bool, Optional[PermissionDeviation], str]:
         from app.services.snapshot_service import SnapshotSyncService
 
         deviation = db.query(PermissionDeviation).get(deviation_id)
         if not deviation:
-            return None
+            return False, None, "偏离记录不存在"
 
         user = db.query(User).get(deviation.user_id)
         if not user:
             logger.error(f"偏离记录#{deviation_id}对应的用户不存在")
-            return None
-
-        adjust_result = None
-        adjust_message = ""
+            return False, deviation, "偏离记录对应的用户不存在"
 
         if action_type == "adjust_permission":
             grant = deviation.deviation_type == "deficient"
@@ -318,12 +323,10 @@ class DeviationDetectionService:
                 grant=grant,
                 operator_name=operator_name,
             )
-            adjust_result = success
-            adjust_message = message
 
             if not success:
                 logger.error(f"调整权限失败: {message}")
-                deviation.status = "failed"
+                deviation.status = "processing"
                 deviation.updated_at = datetime.now()
                 db.commit()
                 db.refresh(deviation)
@@ -338,7 +341,7 @@ class DeviationDetectionService:
                     username=operator_name,
                     status="failed",
                 )
-                return deviation
+                return False, deviation, message
 
             deviation.status = "resolved"
             deviation.resolved_action = "adjusted"
@@ -353,10 +356,11 @@ class DeviationDetectionService:
                 action_type="adjust_permission",
                 target_type="deviation",
                 target_id=deviation.id,
-                details=f"已调整权限，{adjust_message}，备注: {remarks or '无'}",
+                details=f"已调整权限，{message}，备注: {remarks or '无'}",
                 username=operator_name,
                 status="success",
             )
+            return True, deviation, "权限调整成功"
 
         elif action_type == "update_risk":
             old_risk_level = deviation.risk_level
@@ -389,6 +393,7 @@ class DeviationDetectionService:
                 username=operator_name,
                 status="success",
             )
+            return True, deviation, "风险标记更新成功"
 
         else:
             deviation.status = "resolved"
@@ -408,8 +413,7 @@ class DeviationDetectionService:
                 username=operator_name,
                 status="success",
             )
-
-        return deviation
+            return True, deviation, "已标记为已解决"
 
     @classmethod
     def get_deviation_statistics(

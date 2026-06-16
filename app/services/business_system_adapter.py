@@ -153,6 +153,9 @@ class MockBusinessSystemAdapter(BusinessSystemAdapter):
         self.use_random_permissions = False
         self.should_fail = False
         self.fixed_permissions: Dict[str, Dict[str, bool]] = {}
+        self.adjust_should_fail = False
+        self.adjust_fail_system: Optional[str] = None
+        self.adjust_fail_message: str = "模拟权限调整失败：业务系统接口异常"
 
     def set_fixed_permissions(self, system_code: str, permissions: Dict[str, bool]):
         self.fixed_permissions[system_code] = permissions
@@ -169,6 +172,15 @@ class MockBusinessSystemAdapter(BusinessSystemAdapter):
         status = "启用" if fail else "禁用"
         target = f"[{system_code}]" if system_code else "全局"
         logger.info(f"Mock适配器{target}接口失败模拟已{status}")
+
+    def set_adjust_should_fail(self, fail: bool, system_code: Optional[str] = None,
+                               message: str = "模拟权限调整失败：业务系统接口异常"):
+        self.adjust_should_fail = fail
+        self.adjust_fail_system = system_code
+        self.adjust_fail_message = message
+        status = "启用" if fail else "禁用"
+        target = f"[{system_code}]" if system_code else "全局"
+        logger.info(f"Mock适配器{target}权限调整失败模拟已{status}")
 
     def fetch_permissions(self, user_identifier: str, system_code: str) -> Tuple[bool, Optional[Dict[str, bool]], str]:
         if self.should_fail and (self._fail_system is None or self._fail_system == system_code):
@@ -203,6 +215,10 @@ class MockBusinessSystemAdapter(BusinessSystemAdapter):
     def adjust_permission(self, user_identifier: str, system_code: str,
                           permission_code: str, grant: bool) -> Tuple[bool, str]:
         action_text = "授予" if grant else "撤销"
+
+        if self.adjust_should_fail and (self.adjust_fail_system is None or self.adjust_fail_system == system_code):
+            logger.warning(f"Mock适配器{action_text}权限失败: {self.adjust_fail_message}")
+            return False, self.adjust_fail_message
 
         if system_code not in self.fixed_permissions:
             self.fixed_permissions[system_code] = {}

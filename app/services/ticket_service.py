@@ -248,22 +248,35 @@ class TicketService:
         resolver_id: int,
         resolver_name: str,
         remarks: Optional[str] = None,
-    ) -> Optional[AuditTicket]:
+    ) -> Tuple[bool, Optional[AuditTicket], str]:
         ticket = db.query(AuditTicket).get(ticket_id)
         if not ticket:
-            return None
+            return False, None, "工单不存在"
 
         from app.services.deviation_service import DeviationDetectionService
 
         deviation = db.query(PermissionDeviation).get(ticket.deviation_id)
         if deviation:
-            DeviationDetectionService.resolve_deviation(
+            success, dev, message = DeviationDetectionService.resolve_deviation(
                 db=db,
                 deviation_id=deviation.id,
                 action_type=action_type,
                 operator_name=resolver_name,
                 remarks=remarks,
             )
+            if not success:
+                log_audit(
+                    db=db,
+                    action="resolve_ticket_failed",
+                    action_type="resolution",
+                    target_type="ticket",
+                    target_id=ticket.id,
+                    details=f"工单[{ticket.ticket_no}]处理失败: {message}",
+                    username=resolver_name,
+                    status="failed",
+                )
+                logger.warning(f"工单[{ticket.ticket_no}]处理失败: {message}，工单保持打开状态")
+                return False, ticket, message
 
         ticket.status = "resolved"
         ticket.resolution = resolution
@@ -291,7 +304,7 @@ class TicketService:
         )
 
         logger.info(f"工单[{ticket.ticket_no}]已由{resolver_name}解决")
-        return ticket
+        return True, ticket, "处理成功"
 
     @classmethod
     def get_tickets(

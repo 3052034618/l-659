@@ -53,12 +53,16 @@ def resolve_ticket(
     resolver_id = 1
     resolver_name = "admin"
 
-    resolved = TicketService.resolve_ticket(
+    success, resolved_ticket, message = TicketService.resolve_ticket(
         db, ticket_id, resolution, action_type, resolver_id, resolver_name, remarks
     )
-    if not resolved:
-        raise HTTPException(status_code=500, detail="处理工单失败")
-    return {"success": True, "message": "工单已解决", "data": {"ticket_no": resolved.ticket_no}}
+    if not success:
+        raise HTTPException(status_code=400, detail=f"处理失败: {message}")
+    return {
+        "success": True,
+        "message": "工单已解决",
+        "data": {"ticket_no": resolved_ticket.ticket_no if resolved_ticket else ""}
+    }
 
 
 @router.get("/", summary="工单列表")

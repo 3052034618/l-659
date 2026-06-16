@@ -111,7 +111,7 @@ class SnapshotSyncService:
         system_code: str,
         snapshot_date: Optional[date] = None,
         trigger_by: str = "system",
-    ) -> Optional[PermissionSnapshot]:
+    ) -> Tuple[Optional[PermissionSnapshot], str]:
         snapshot_date = snapshot_date or date.today()
 
         existing = db.query(PermissionSnapshot).filter(
@@ -124,7 +124,7 @@ class SnapshotSyncService:
 
         if existing:
             logger.info(f"用户[{user.username}]在{system_code}的快照已存在，跳过")
-            return existing
+            return existing, "快照已存在，跳过同步"
 
         permissions, message = cls._fetch_business_system_permissions(system_code, user, db)
         if permissions is None:
@@ -139,7 +139,7 @@ class SnapshotSyncService:
                 status="failed",
             )
             logger.warning(f"用户[{user.username}]在{system_code}的快照同步失败: {message}")
-            return None
+            return None, message
 
         last_snapshot = db.query(PermissionSnapshot).filter(
             and_(
@@ -183,7 +183,7 @@ class SnapshotSyncService:
         )
 
         logger.info(f"已创建用户[{user.username}]在[{system_code}]的权限快照#{snapshot.id}")
-        return snapshot
+        return snapshot, "同步成功"
 
     @classmethod
     def _record_changes(
@@ -247,7 +247,7 @@ class SnapshotSyncService:
     ) -> List[PermissionSnapshot]:
         snapshots = []
         for sys_info in settings.BUSINESS_SYSTEMS:
-            snapshot = cls.sync_user_system_snapshot(
+            snapshot, _ = cls.sync_user_system_snapshot(
                 db=db,
                 user=user,
                 system_code=sys_info["code"],
@@ -265,7 +265,7 @@ class SnapshotSyncService:
         system_code: Optional[str] = None,
         user_ids: Optional[List[int]] = None,
         trigger_by: str = "scheduled_task",
-    ) -> Dict[str, int]:
+    ) -> Dict:
         query = db.query(User).filter(User.is_active == True)
         if user_ids:
             query = query.filter(User.id.in_(user_ids))
@@ -273,29 +273,63 @@ class SnapshotSyncService:
         users = query.all()
         success_count = 0
         total_snapshots = 0
+        failed_items = []
 
         for user in users:
-            try:
-                if system_code:
-                    snapshot = cls.sync_user_system_snapshot(db, user, system_code, trigger_by=trigger_by)
-                    if snapshot:
-                        success_count += 1
-                        total_snapshots += 1
+            user_failures = []
+            user_success_count = 0
+            if system_code:
+                snapshot, message = cls.sync_user_system_snapshot(db, user, system_code, trigger_by=trigger_by)
+                if snapshot:
+                    success_count += 1
+                    total_snapshots += 1
+                    user_success_count = 1
                 else:
-                    snapshots = cls.sync_all_systems_for_user(db, user, trigger_by=trigger_by)
-                    if snapshots:
-                        success_count += 1
-                        total_snapshots += len(snapshots)
-            except Exception as e:
-                logger.error(f"同步用户[{user.username}]失败: {str(e)}")
-                continue
+                    sys_info = next((s for s in settings.BUSINESS_SYSTEMS if s["code"] == system_code), None)
+                    user_failures.append({
+                        "system_code": system_code,
+                        "system_name": sys_info["name"] if sys_info else system_code,
+                        "reason": message,
+                    })
+            else:
+                for sys_info in settings.BUSINESS_SYSTEMS:
+                    snapshot, message = cls.sync_user_system_snapshot(
+                        db=db,
+                        user=user,
+                        system_code=sys_info["code"],
+                        trigger_by=trigger_by,
+                    )
+                    if snapshot:
+                        total_snapshots += 1
+                        user_success_count += 1
+                    else:
+                        user_failures.append({
+                            "system_code": sys_info["code"],
+                            "system_name": sys_info["name"],
+                            "reason": message,
+                        })
+                if user_success_count > 0:
+                    success_count += 1
+
+            if user_failures:
+                failed_items.append({
+                    "user_id": user.id,
+                    "username": user.username,
+                    "full_name": user.full_name,
+                    "failed_systems": user_failures,
+                })
+
+        all_success = len(failed_items) == 0 and total_snapshots > 0
 
         result = {
             "total_users": len(users),
             "success_users": success_count,
+            "failed_users": len(failed_items),
             "total_snapshots": total_snapshots,
+            "failed_items": failed_items,
+            "all_success": all_success,
         }
-        logger.info(f"权限快照同步完成: {result}")
+        logger.info(f"权限快照同步完成: 成功{total_snapshots}个快照，失败{len(failed_items)}个用户")
         return result
 
     @classmethod
