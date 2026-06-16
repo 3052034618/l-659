@@ -89,6 +89,7 @@ class PermissionDeviation(Base):
     status = Column(String(20), default="pending")
     description = Column(Text, nullable=True)
     resolved_at = Column(DateTime, nullable=True)
+    resolved_action = Column(String(50), nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 

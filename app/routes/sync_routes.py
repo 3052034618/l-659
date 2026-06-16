@@ -108,34 +108,16 @@ def list_deviations(
     db: Session = Depends(get_db),
 ):
     items, total = CRUDService.list_deviations(db, user_id, system_code, risk_level, status, page, page_size)
-    from app.utils import get_deviation_type_text, get_risk_level_text, get_status_text
+    from app.utils import deviation_to_dict, get_system_name
     from app.models import User
     result_items = []
     for item in items:
+        dev_dict = deviation_to_dict(item)
         user = db.query(User).get(item.user_id)
-        d = {
-            "id": item.id,
-            "user_id": item.user_id,
-            "username": user.username if user else "-",
-            "full_name": user.full_name if user else "-",
-            "system_code": item.system_code,
-            "system_name": get_system_name(item.system_code),
-            "permission_code": item.permission_code,
-            "permission_name": item.permission_name,
-            "deviation_type": item.deviation_type,
-            "deviation_type_text": get_deviation_type_text(item.deviation_type),
-            "standard_value": item.standard_value,
-            "actual_value": item.actual_value,
-            "risk_score": item.risk_score,
-            "risk_level": item.risk_level,
-            "risk_level_text": get_risk_level_text(item.risk_level),
-            "status": item.status,
-            "status_text": get_status_text(item.status),
-            "description": item.description,
-            "created_at": item.created_at,
-            "resolved_at": item.resolved_at,
-        }
-        result_items.append(d)
+        dev_dict["username"] = user.username if user else "-"
+        dev_dict["full_name"] = user.full_name if user else "-"
+        dev_dict["system_name"] = get_system_name(item.system_code)
+        result_items.append(dev_dict)
     return {"total": total, "page": page, "page_size": page_size, "items": result_items}
 
 

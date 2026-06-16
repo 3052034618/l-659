@@ -72,35 +72,8 @@ def list_tickets(
     db: Session = Depends(get_db),
 ):
     items, total = TicketService.get_tickets(db, status, priority, assignee_id, escalated, page, page_size)
-    result_items = []
-    for item in items:
-        assignee = db.query(User).get(item.assignee_id)
-        deviation = db.query(PermissionDeviation).get(item.deviation_id)
-        escalated_to = db.query(User).get(item.escalated_to) if item.escalated_to else None
-        d = {
-            "id": item.id,
-            "ticket_no": item.ticket_no,
-            "title": item.title,
-            "status": item.status,
-            "status_text": get_status_text(item.status),
-            "priority": item.priority,
-            "priority_text": {"critical": "紧急", "urgent": "高", "high": "中", "normal": "低", "low": "极低"}.get(item.priority, item.priority),
-            "assignee_id": item.assignee_id,
-            "assignee_name": assignee.full_name if assignee else "未分配",
-            "deviation_id": item.deviation_id,
-            "escalated": item.escalated,
-            "escalated_at": item.escalated_at,
-            "escalated_to_name": escalated_to.full_name if escalated_to else None,
-            "remarks": item.remarks,
-            "resolution": item.resolution,
-            "action_type": item.action_type,
-            "resolved_at": item.resolved_at,
-            "created_at": item.created_at,
-            "updated_at": item.updated_at,
-            "risk_level_text": get_risk_level_text(deviation.risk_level) if deviation else None,
-            "system_name": get_system_name(deviation.system_code) if deviation else None,
-        }
-        result_items.append(d)
+    from app.utils import ticket_to_dict
+    result_items = [ticket_to_dict(item, db) for item in items]
     return {"total": total, "page": page, "page_size": page_size, "items": result_items}
 
 
@@ -109,39 +82,8 @@ def get_ticket(ticket_id: int, db: Session = Depends(get_db)):
     ticket = db.query(AuditTicket).get(ticket_id)
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
-
-    assignee = db.query(User).get(ticket.assignee_id)
-    deviation = db.query(PermissionDeviation).get(ticket.deviation_id)
-    user = db.query(User).get(deviation.user_id) if deviation else None
-
-    return {
-        "id": ticket.id,
-        "ticket_no": ticket.ticket_no,
-        "title": ticket.title,
-        "status": ticket.status,
-        "status_text": get_status_text(ticket.status),
-        "priority": ticket.priority,
-        "assignee": assignee.full_name if assignee else None,
-        "escalated": ticket.escalated,
-        "escalated_at": ticket.escalated_at,
-        "remarks": ticket.remarks,
-        "resolution": ticket.resolution,
-        "resolved_at": ticket.resolved_at,
-        "created_at": ticket.created_at,
-        "deviation": {
-            "id": deviation.id if deviation else None,
-            "username": user.username if user else None,
-            "full_name": user.full_name if user else None,
-            "system_code": deviation.system_code if deviation else None,
-            "system_name": get_system_name(deviation.system_code) if deviation else None,
-            "permission_name": deviation.permission_name if deviation else None,
-            "deviation_type_text": get_risk_level_text(deviation.deviation_type) if deviation else None,
-            "risk_score": deviation.risk_score if deviation else None,
-            "risk_level": deviation.risk_level if deviation else None,
-            "risk_level_text": get_risk_level_text(deviation.risk_level) if deviation else None,
-            "description": deviation.description if deviation else None,
-        } if deviation else None,
-    }
+    from app.utils import ticket_to_dict
+    return ticket_to_dict(ticket, db)
 
 
 @router.get("/statistics/summary", summary="工单统计")

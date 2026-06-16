@@ -1,10 +1,11 @@
 from datetime import date, datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from app.models import PermissionSnapshot, User, PermissionChangeHistory
 from app.core.config import settings
 from app.utils import logger, log_audit
+from app.services.business_system_adapter import get_business_system_adapter, AdapterFactory
 import random
 
 
@@ -78,23 +79,29 @@ class SnapshotSyncService:
         system_code: str,
         user: User,
         db: Session,
-    ) -> Optional[Dict[str, bool]]:
+    ) -> Tuple[Optional[Dict[str, bool]], str]:
         try:
             system_info = next(
                 (s for s in settings.BUSINESS_SYSTEMS if s["code"] == system_code),
                 None
             )
             if not system_info:
-                logger.warning(f"未找到系统配置: {system_code}")
-                return None
+                return None, f"未找到系统配置: {system_code}"
 
-            permissions = cls._generate_mock_permissions(system_code, user.role)
-            logger.info(f"从{system_info['name']}获取用户[{user.username}]权限: {len(permissions)}项")
-            return permissions
+            adapter = get_business_system_adapter()
+            success, permissions, message = adapter.fetch_permissions(user.username, system_code)
+
+            if not success or permissions is None:
+                logger.error(f"获取{system_info['name']}用户[{user.username}]权限失败: {message}")
+                return None, message
+
+            logger.info(f"从{system_info['name']}获取用户[{user.username}]权限: {len(permissions)}项 - {message}")
+            return permissions, message
 
         except Exception as e:
-            logger.error(f"获取业务系统[{system_code}]权限失败: {str(e)}")
-            return None
+            error_msg = f"获取业务系统[{system_code}]权限异常: {str(e)}"
+            logger.error(error_msg)
+            return None, error_msg
 
     @classmethod
     def sync_user_system_snapshot(
@@ -119,8 +126,19 @@ class SnapshotSyncService:
             logger.info(f"用户[{user.username}]在{system_code}的快照已存在，跳过")
             return existing
 
-        permissions = cls._fetch_business_system_permissions(system_code, user, db)
+        permissions, message = cls._fetch_business_system_permissions(system_code, user, db)
         if permissions is None:
+            log_audit(
+                db=db,
+                action="sync_snapshot_failed",
+                action_type="sync",
+                target_type="user",
+                target_id=user.id,
+                details=f"同步用户[{user.username}]在[{system_code}]的权限快照失败: {message}",
+                username=trigger_by,
+                status="failed",
+            )
+            logger.warning(f"用户[{user.username}]在{system_code}的快照同步失败: {message}")
             return None
 
         last_snapshot = db.query(PermissionSnapshot).filter(
@@ -294,3 +312,107 @@ class SnapshotSyncService:
             db.commit()
             return True
         return False
+
+    @classmethod
+    def adjust_user_permission(
+        cls,
+        db: Session,
+        user: User,
+        system_code: str,
+        permission_code: str,
+        grant: bool,
+        operator_name: str = "system",
+    ) -> Tuple[bool, str]:
+        """
+        调整用户权限：调用业务系统接口调整权限，更新本地快照，记录变更历史
+        返回: (success: bool, message: str)
+        """
+        from app.services.business_system_adapter import get_business_system_adapter
+        from app.utils import get_system_name
+
+        adapter = get_business_system_adapter()
+
+        action_text = "授予" if grant else "撤销"
+        sys_name = get_system_name(system_code)
+
+        logger.info(
+            f"[{operator_name}]正在{action_text}用户[{user.username}]在[{sys_name}]的权限[{permission_code}]"
+        )
+
+        success, message = adapter.adjust_permission(
+            user.username, system_code, permission_code, grant
+        )
+
+        if not success:
+            logger.error(f"调整权限失败: {message}")
+            return False, message
+
+        current_snapshot = db.query(PermissionSnapshot).filter(
+            and_(
+                PermissionSnapshot.user_id == user.id,
+                PermissionSnapshot.system_code == system_code,
+            )
+        ).order_by(PermissionSnapshot.snapshot_date.desc()).first()
+
+        old_perms = current_snapshot.permissions.copy() if current_snapshot and current_snapshot.permissions else {}
+        new_perms = old_perms.copy()
+        new_perms[permission_code] = grant
+
+        change_type = "grant" if grant else "revoke"
+        old_val = old_perms.get(permission_code, False)
+        new_val = grant
+
+        if old_val == new_val:
+            logger.info(f"权限[{permission_code}]已是{new_val}，无需变更")
+            return True, f"权限已是{action_text}状态，无需变更"
+
+        perm_info = None
+        for sys_c, perms in cls.MOCK_PERMISSIONS.items():
+            if sys_c == system_code:
+                for p in perms:
+                    if p["code"] == permission_code:
+                        perm_info = p
+                        break
+                break
+
+        perm_name = perm_info["name"] if perm_info else permission_code
+
+        history = PermissionChangeHistory(
+            user_id=user.id,
+            system_code=system_code,
+            permission_code=permission_code,
+            change_type=change_type,
+            old_value=old_val,
+            new_value=new_val,
+            operator=operator_name,
+            change_reason=f"审计工单处理，{action_text}权限[{perm_name}]",
+            source="audit_ticket",
+            created_at=datetime.now(),
+        )
+        db.add(history)
+
+        new_snapshot = PermissionSnapshot(
+            user_id=user.id,
+            system_code=system_code,
+            snapshot_date=date.today(),
+            permissions=new_perms,
+            sync_source="audit_adjustment",
+            is_processed=False,
+            created_at=datetime.now(),
+        )
+        db.add(new_snapshot)
+        db.commit()
+
+        log_audit(
+            db=db,
+            action="adjust_user_permission",
+            action_type="adjust",
+            target_type="user",
+            target_id=user.id,
+            details=f"{action_text}用户[{user.username}]在[{sys_name}]的权限[{perm_name}]",
+            username=operator_name,
+            status="success",
+        )
+
+        logger.info(f"权限调整成功：{action_text}[{permission_code}]，已生成新快照#{new_snapshot.id}和变更历史")
+        return True, f"已成功{action_text}权限[{perm_name}]，变更已记录"

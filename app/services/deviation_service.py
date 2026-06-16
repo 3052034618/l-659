@@ -294,26 +294,120 @@ class DeviationDetectionService:
         operator_name: str,
         remarks: Optional[str] = None,
     ) -> Optional[PermissionDeviation]:
+        from app.services.snapshot_service import SnapshotSyncService
+
         deviation = db.query(PermissionDeviation).get(deviation_id)
         if not deviation:
             return None
 
-        deviation.status = "resolved"
-        deviation.resolved_at = datetime.now()
-        deviation.updated_at = datetime.now()
-        db.commit()
-        db.refresh(deviation)
+        user = db.query(User).get(deviation.user_id)
+        if not user:
+            logger.error(f"偏离记录#{deviation_id}对应的用户不存在")
+            return None
 
-        log_audit(
-            db=db,
-            action="resolve_deviation",
-            action_type="resolution",
-            target_type="deviation",
-            target_id=deviation.id,
-            details=f"处理方式: {action_type}, 备注: {remarks or '无'}",
-            username=operator_name,
-            status="success",
-        )
+        adjust_result = None
+        adjust_message = ""
+
+        if action_type == "adjust_permission":
+            grant = deviation.deviation_type == "deficient"
+            success, message = SnapshotSyncService.adjust_user_permission(
+                db=db,
+                user=user,
+                system_code=deviation.system_code,
+                permission_code=deviation.permission_code,
+                grant=grant,
+                operator_name=operator_name,
+            )
+            adjust_result = success
+            adjust_message = message
+
+            if not success:
+                logger.error(f"调整权限失败: {message}")
+                deviation.status = "failed"
+                deviation.updated_at = datetime.now()
+                db.commit()
+                db.refresh(deviation)
+
+                log_audit(
+                    db=db,
+                    action="resolve_deviation",
+                    action_type="adjust_failed",
+                    target_type="deviation",
+                    target_id=deviation.id,
+                    details=f"权限调整失败: {message}",
+                    username=operator_name,
+                    status="failed",
+                )
+                return deviation
+
+            deviation.status = "resolved"
+            deviation.resolved_action = "adjusted"
+            deviation.resolved_at = datetime.now()
+            deviation.updated_at = datetime.now()
+            db.commit()
+            db.refresh(deviation)
+
+            log_audit(
+                db=db,
+                action="resolve_deviation",
+                action_type="adjust_permission",
+                target_type="deviation",
+                target_id=deviation.id,
+                details=f"已调整权限，{adjust_message}，备注: {remarks or '无'}",
+                username=operator_name,
+                status="success",
+            )
+
+        elif action_type == "update_risk":
+            old_risk_level = deviation.risk_level
+            old_risk_score = deviation.risk_score
+
+            if deviation.risk_level == "high":
+                deviation.risk_level = "medium"
+                deviation.risk_score = min(deviation.risk_score * 0.6, 60.0)
+            elif deviation.risk_level == "medium":
+                deviation.risk_level = "low"
+                deviation.risk_score = min(deviation.risk_score * 0.5, 30.0)
+
+            deviation.status = "resolved"
+            deviation.resolved_action = "risk_updated"
+            deviation.resolved_at = datetime.now()
+            deviation.updated_at = datetime.now()
+            db.commit()
+            db.refresh(deviation)
+
+            log_audit(
+                db=db,
+                action="resolve_deviation",
+                action_type="update_risk",
+                target_type="deviation",
+                target_id=deviation.id,
+                details=(
+                    f"已更新风险标记: {old_risk_level}({old_risk_score}) → "
+                    f"{deviation.risk_level}({deviation.risk_score})，备注: {remarks or '无'}"
+                ),
+                username=operator_name,
+                status="success",
+            )
+
+        else:
+            deviation.status = "resolved"
+            deviation.resolved_action = "marked"
+            deviation.resolved_at = datetime.now()
+            deviation.updated_at = datetime.now()
+            db.commit()
+            db.refresh(deviation)
+
+            log_audit(
+                db=db,
+                action="resolve_deviation",
+                action_type="mark_resolved",
+                target_type="deviation",
+                target_id=deviation.id,
+                details=f"标记为已解决，备注: {remarks or '无'}",
+                username=operator_name,
+                status="success",
+            )
 
         return deviation
 
