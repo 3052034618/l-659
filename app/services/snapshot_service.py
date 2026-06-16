@@ -111,7 +111,9 @@ class SnapshotSyncService:
         system_code: str,
         snapshot_date: Optional[date] = None,
         trigger_by: str = "system",
-    ) -> Tuple[Optional[PermissionSnapshot], str]:
+        force_refresh: bool = False,
+        audit_batch_id: Optional[int] = None,
+    ) -> Tuple[Optional[PermissionSnapshot], str, str]:
         snapshot_date = snapshot_date or date.today()
 
         existing = db.query(PermissionSnapshot).filter(
@@ -122,12 +124,37 @@ class SnapshotSyncService:
             )
         ).first()
 
-        if existing:
-            logger.info(f"用户[{user.username}]在{system_code}的快照已存在，跳过")
-            return existing, "快照已存在，跳过同步"
+        if existing and not force_refresh:
+            existing.audit_batch_id = audit_batch_id
+            existing.sync_status = "skipped"
+            existing.skip_reason = "今日快照已存在，复用已有快照"
+            db.commit()
+            db.refresh(existing)
+            logger.info(f"用户[{user.username}]在{system_code}的快照已存在，跳过同步，audit_batch_id={audit_batch_id}")
+            return existing, "今日快照已存在，复用已有快照", "skipped"
+
+        if existing and force_refresh:
+            db.delete(existing)
+            db.commit()
+            logger.info(f"用户[{user.username}]在{system_code}的快照已删除（force_refresh=true）")
 
         permissions, message = cls._fetch_business_system_permissions(system_code, user, db)
         if permissions is None:
+            if audit_batch_id:
+                failed_snap = PermissionSnapshot(
+                    user_id=user.id,
+                    system_code=system_code,
+                    snapshot_date=snapshot_date,
+                    permissions={},
+                    sync_source=trigger_by,
+                    is_processed=True,
+                    sync_status="failed",
+                    skip_reason=message,
+                    audit_batch_id=audit_batch_id,
+                )
+                db.add(failed_snap)
+                db.commit()
+
             log_audit(
                 db=db,
                 action="sync_snapshot_failed",
@@ -139,7 +166,7 @@ class SnapshotSyncService:
                 status="failed",
             )
             logger.warning(f"用户[{user.username}]在{system_code}的快照同步失败: {message}")
-            return None, message
+            return None, message, "failed"
 
         last_snapshot = db.query(PermissionSnapshot).filter(
             and_(
@@ -156,6 +183,7 @@ class SnapshotSyncService:
                 old_perms=last_snapshot.permissions,
                 new_perms=permissions,
                 trigger_by=trigger_by,
+                audit_batch_id=audit_batch_id,
             )
 
         snapshot = PermissionSnapshot(
@@ -165,6 +193,8 @@ class SnapshotSyncService:
             permissions=permissions,
             sync_source=trigger_by,
             is_processed=False,
+            sync_status="success",
+            audit_batch_id=audit_batch_id,
             created_at=datetime.now(),
         )
         db.add(snapshot)
@@ -183,7 +213,7 @@ class SnapshotSyncService:
         )
 
         logger.info(f"已创建用户[{user.username}]在[{system_code}]的权限快照#{snapshot.id}")
-        return snapshot, "同步成功"
+        return snapshot, "同步成功", "success"
 
     @classmethod
     def _record_changes(
@@ -194,6 +224,7 @@ class SnapshotSyncService:
         old_perms: Dict[str, bool],
         new_perms: Dict[str, bool],
         trigger_by: str,
+        audit_batch_id: Optional[int] = None,
     ):
         all_codes = set(old_perms.keys()) | set(new_perms.keys())
         change_count = 0
@@ -229,6 +260,7 @@ class SnapshotSyncService:
                     operator=trigger_by,
                     change_reason="定期同步检测到的权限变更",
                     source="auto_sync",
+                    audit_batch_id=audit_batch_id,
                     created_at=datetime.now(),
                 )
                 db.add(history)
@@ -244,19 +276,52 @@ class SnapshotSyncService:
         user: User,
         snapshot_date: Optional[date] = None,
         trigger_by: str = "system",
-    ) -> List[PermissionSnapshot]:
-        snapshots = []
+        force_refresh: bool = False,
+        audit_batch_id: Optional[int] = None,
+    ) -> Dict:
+        success_snapshots = 0
+        skipped_snapshots = 0
+        failed_snapshots = 0
+        failed_systems = []
+        skipped_systems = []
+        new_snapshot_ids = []
+
         for sys_info in settings.BUSINESS_SYSTEMS:
-            snapshot, _ = cls.sync_user_system_snapshot(
+            snapshot, message, status = cls.sync_user_system_snapshot(
                 db=db,
                 user=user,
                 system_code=sys_info["code"],
                 snapshot_date=snapshot_date,
                 trigger_by=trigger_by,
+                force_refresh=force_refresh,
+                audit_batch_id=audit_batch_id,
             )
-            if snapshot:
-                snapshots.append(snapshot)
-        return snapshots
+            if status == "success":
+                success_snapshots += 1
+                new_snapshot_ids.append(snapshot.id)
+            elif status == "skipped":
+                skipped_snapshots += 1
+                skipped_systems.append({
+                    "system_code": sys_info["code"],
+                    "system_name": sys_info["name"],
+                    "reason": message,
+                })
+            else:
+                failed_snapshots += 1
+                failed_systems.append({
+                    "system_code": sys_info["code"],
+                    "system_name": sys_info["name"],
+                    "reason": message,
+                })
+
+        return {
+            "success_snapshots": success_snapshots,
+            "skipped_snapshots": skipped_snapshots,
+            "failed_snapshots": failed_snapshots,
+            "new_snapshot_ids": new_snapshot_ids,
+            "failed_systems": failed_systems,
+            "skipped_systems": skipped_systems,
+        }
 
     @classmethod
     def sync_all_users(
@@ -265,6 +330,7 @@ class SnapshotSyncService:
         system_code: Optional[str] = None,
         user_ids: Optional[List[int]] = None,
         trigger_by: str = "scheduled_task",
+        force_refresh: bool = False,
     ) -> Dict:
         query = db.query(User).filter(User.is_active == True)
         if user_ids:
@@ -272,18 +338,35 @@ class SnapshotSyncService:
 
         users = query.all()
         success_count = 0
-        total_snapshots = 0
+        success_snapshots = 0
+        skipped_snapshots = 0
+        failed_snapshots = 0
         failed_items = []
+        skipped_items = []
+        new_snapshot_ids = []
 
         for user in users:
             user_failures = []
+            user_skipped = []
             user_success_count = 0
             if system_code:
-                snapshot, message = cls.sync_user_system_snapshot(db, user, system_code, trigger_by=trigger_by)
-                if snapshot:
+                snapshot, message, status = cls.sync_user_system_snapshot(
+                    db, user, system_code, trigger_by=trigger_by, force_refresh=force_refresh
+                )
+                if status == "success":
                     success_count += 1
-                    total_snapshots += 1
+                    success_snapshots += 1
                     user_success_count = 1
+                    new_snapshot_ids.append(snapshot.id)
+                elif status == "skipped":
+                    success_count += 1
+                    skipped_snapshots += 1
+                    sys_info = next((s for s in settings.BUSINESS_SYSTEMS if s["code"] == system_code), None)
+                    user_skipped.append({
+                        "system_code": system_code,
+                        "system_name": sys_info["name"] if sys_info else system_code,
+                        "reason": message,
+                    })
                 else:
                     sys_info = next((s for s in settings.BUSINESS_SYSTEMS if s["code"] == system_code), None)
                     user_failures.append({
@@ -293,22 +376,32 @@ class SnapshotSyncService:
                     })
             else:
                 for sys_info in settings.BUSINESS_SYSTEMS:
-                    snapshot, message = cls.sync_user_system_snapshot(
+                    snapshot, message, status = cls.sync_user_system_snapshot(
                         db=db,
                         user=user,
                         system_code=sys_info["code"],
                         trigger_by=trigger_by,
+                        force_refresh=force_refresh,
                     )
-                    if snapshot:
-                        total_snapshots += 1
+                    if status == "success":
+                        success_snapshots += 1
                         user_success_count += 1
+                        new_snapshot_ids.append(snapshot.id)
+                    elif status == "skipped":
+                        skipped_snapshots += 1
+                        user_skipped.append({
+                            "system_code": sys_info["code"],
+                            "system_name": sys_info["name"],
+                            "reason": message,
+                        })
                     else:
+                        failed_snapshots += 1
                         user_failures.append({
                             "system_code": sys_info["code"],
                             "system_name": sys_info["name"],
                             "reason": message,
                         })
-                if user_success_count > 0:
+                if user_success_count > 0 or len(user_skipped) > 0:
                     success_count += 1
 
             if user_failures:
@@ -318,19 +411,122 @@ class SnapshotSyncService:
                     "full_name": user.full_name,
                     "failed_systems": user_failures,
                 })
+            if user_skipped:
+                skipped_items.append({
+                    "user_id": user.id,
+                    "username": user.username,
+                    "full_name": user.full_name,
+                    "skipped_systems": user_skipped,
+                })
 
-        all_success = len(failed_items) == 0 and total_snapshots > 0
+        all_success = len(failed_items) == 0 and (success_snapshots > 0 or skipped_snapshots > 0)
 
         result = {
             "total_users": len(users),
             "success_users": success_count,
             "failed_users": len(failed_items),
-            "total_snapshots": total_snapshots,
+            "success_snapshots": success_snapshots,
+            "skipped_snapshots": skipped_snapshots,
+            "failed_snapshots": failed_snapshots,
+            "total_snapshots": success_snapshots + skipped_snapshots + failed_snapshots,
             "failed_items": failed_items,
+            "skipped_items": skipped_items,
+            "new_snapshot_ids": new_snapshot_ids,
             "all_success": all_success,
         }
-        logger.info(f"权限快照同步完成: 成功{total_snapshots}个快照，失败{len(failed_items)}个用户")
+        logger.info(f"权限快照同步完成: 成功{success_snapshots}个，跳过{skipped_snapshots}个，失败{failed_snapshots}个")
         return result
+
+    @classmethod
+    def sync_all_users_with_batch(
+        cls,
+        db: Session,
+        audit_batch_id: int,
+        system_code: Optional[str] = None,
+        user_ids: Optional[List[int]] = None,
+        system_codes: Optional[List[str]] = None,
+        trigger_by: str = "audit_batch",
+        force_refresh: bool = False,
+    ) -> Dict:
+        query = db.query(User).filter(User.is_active == True)
+        if user_ids:
+            query = query.filter(User.id.in_(user_ids))
+
+        users = query.all()
+
+        target_systems = settings.BUSINESS_SYSTEMS
+        if system_codes:
+            target_systems = [s for s in settings.BUSINESS_SYSTEMS if s["code"] in system_codes]
+
+        success_snapshots = 0
+        skipped_snapshots = 0
+        failed_snapshots = 0
+        failed_items = []
+        skipped_items = []
+        new_snapshot_ids = []
+
+        for user in users:
+            user_failures = []
+            user_skipped = []
+            user_success = 0
+
+            if system_code:
+                sys_list = [s for s in target_systems if s["code"] == system_code]
+            else:
+                sys_list = target_systems
+
+            for sys_info in sys_list:
+                snapshot, message, status = cls.sync_user_system_snapshot(
+                    db=db,
+                    user=user,
+                    system_code=sys_info["code"],
+                    trigger_by=trigger_by,
+                    force_refresh=force_refresh,
+                    audit_batch_id=audit_batch_id,
+                )
+                if status == "success":
+                    success_snapshots += 1
+                    user_success += 1
+                    new_snapshot_ids.append(snapshot.id)
+                elif status == "skipped":
+                    skipped_snapshots += 1
+                    user_skipped.append({
+                        "system_code": sys_info["code"],
+                        "system_name": sys_info["name"],
+                        "reason": message,
+                    })
+                else:
+                    failed_snapshots += 1
+                    user_failures.append({
+                        "system_code": sys_info["code"],
+                        "system_name": sys_info["name"],
+                        "reason": message,
+                    })
+
+            if user_failures:
+                failed_items.append({
+                    "user_id": user.id,
+                    "username": user.username,
+                    "full_name": user.full_name,
+                    "failed_systems": user_failures,
+                })
+            if user_skipped:
+                skipped_items.append({
+                    "user_id": user.id,
+                    "username": user.username,
+                    "full_name": user.full_name,
+                    "skipped_systems": user_skipped,
+                })
+
+        return {
+            "total_users": len(users),
+            "success_snapshots": success_snapshots,
+            "skipped_snapshots": skipped_snapshots,
+            "failed_snapshots": failed_snapshots,
+            "new_snapshot_ids": new_snapshot_ids,
+            "failed_items": failed_items,
+            "skipped_items": skipped_items,
+        }
 
     @classmethod
     def get_unprocessed_snapshots(cls, db: Session) -> List[PermissionSnapshot]:
@@ -356,6 +552,7 @@ class SnapshotSyncService:
         permission_code: str,
         grant: bool,
         operator_name: str = "system",
+        audit_batch_id: Optional[int] = None,
     ) -> Tuple[bool, str]:
         """
         调整用户权限：调用业务系统接口调整权限，更新本地快照，记录变更历史
@@ -421,6 +618,7 @@ class SnapshotSyncService:
             operator=operator_name,
             change_reason=f"审计工单处理，{action_text}权限[{perm_name}]",
             source="audit_ticket",
+            audit_batch_id=audit_batch_id,
             created_at=datetime.now(),
         )
         db.add(history)
@@ -432,6 +630,8 @@ class SnapshotSyncService:
             permissions=new_perms,
             sync_source="audit_adjustment",
             is_processed=False,
+            sync_status="success",
+            audit_batch_id=audit_batch_id,
             created_at=datetime.now(),
         )
         db.add(new_snapshot)

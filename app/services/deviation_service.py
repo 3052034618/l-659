@@ -137,6 +137,7 @@ class DeviationDetectionService:
         cls,
         db: Session,
         deviations: List[Dict],
+        audit_batch_id: Optional[int] = None,
     ) -> List[PermissionDeviation]:
         saved_deviations = []
         high_risk_deviations = []
@@ -159,6 +160,8 @@ class DeviationDetectionService:
                 existing.standard_value = dev_data["standard_value"]
                 existing.snapshot_id = dev_data["snapshot_id"]
                 existing.updated_at = datetime.now()
+                if audit_batch_id:
+                    existing.audit_batch_id = audit_batch_id
                 saved_deviations.append(existing)
                 if existing.risk_level == "high":
                     high_risk_deviations.append(existing)
@@ -176,6 +179,7 @@ class DeviationDetectionService:
                     risk_level=dev_data["risk_level"],
                     status="pending",
                     description=dev_data["description"],
+                    audit_batch_id=audit_batch_id,
                     created_at=datetime.now(),
                     updated_at=datetime.now(),
                 )
@@ -224,6 +228,7 @@ class DeviationDetectionService:
         cls,
         db: Session,
         snapshot: PermissionSnapshot,
+        audit_batch_id: Optional[int] = None,
     ) -> List[PermissionDeviation]:
         from app.services.snapshot_service import SnapshotSyncService
 
@@ -233,7 +238,7 @@ class DeviationDetectionService:
             return []
 
         deviations_data = cls.compare_permissions(db, snapshot, user)
-        saved_deviations = cls.save_deviations(db, deviations_data)
+        saved_deviations = cls.save_deviations(db, deviations_data, audit_batch_id=audit_batch_id)
 
         SnapshotSyncService.mark_snapshot_processed(db, snapshot.id)
 
@@ -272,7 +277,7 @@ class DeviationDetectionService:
 
         for snapshot in snapshots:
             try:
-                deviations = cls.process_snapshot(db, snapshot)
+                deviations = cls.process_snapshot(db, snapshot, audit_batch_id=audit_batch_id)
                 total_deviations += len(deviations)
                 high_risk_count += len([d for d in deviations if d.risk_level == "high"])
             except Exception as e:
@@ -280,7 +285,7 @@ class DeviationDetectionService:
                 failed_snapshots += 1
                 continue
 
-        new_tickets = TicketService.auto_generate_tickets(db)
+        new_tickets = TicketService.auto_generate_tickets(db, audit_batch_id=audit_batch_id)
         new_ticket_count = len(new_tickets)
 
         result = {
@@ -291,6 +296,65 @@ class DeviationDetectionService:
             "new_ticket_count": new_ticket_count,
         }
         logger.info(f"批量偏离检测完成: {result}")
+        return result
+
+    @classmethod
+    def process_snapshots_with_batch(
+        cls,
+        db: Session,
+        snapshot_ids: List[int],
+        audit_batch_id: Optional[int] = None,
+    ) -> Dict:
+        from app.services.snapshot_service import SnapshotSyncService
+        from app.services.ticket_service import TicketService
+
+        if not snapshot_ids:
+            return {
+                "processed_snapshots": 0,
+                "total_deviations": 0,
+                "high_risk_count": 0,
+                "medium_risk_count": 0,
+                "low_risk_count": 0,
+                "deviations": [],
+                "new_ticket_count": 0,
+            }
+
+        snapshots = db.query(PermissionSnapshot).filter(
+            PermissionSnapshot.id.in_(snapshot_ids),
+            PermissionSnapshot.sync_status == "success",
+        ).all()
+
+        total_deviations = 0
+        high_risk_count = 0
+        medium_risk_count = 0
+        low_risk_count = 0
+        failed_snapshots = 0
+        all_deviations = []
+
+        for snapshot in snapshots:
+            try:
+                deviations = cls.process_snapshot(db, snapshot, audit_batch_id=audit_batch_id)
+                total_deviations += len(deviations)
+                high_risk_count += len([d for d in deviations if d.risk_level == "high"])
+                medium_risk_count += len([d for d in deviations if d.risk_level == "medium"])
+                low_risk_count += len([d for d in deviations if d.risk_level == "low"])
+                all_deviations.extend(deviations)
+            except Exception as e:
+                logger.error(f"处理快照#{snapshot.id}失败: {str(e)}")
+                failed_snapshots += 1
+                continue
+
+        result = {
+            "processed_snapshots": len(snapshots),
+            "failed_snapshots": failed_snapshots,
+            "total_deviations": total_deviations,
+            "high_risk_count": high_risk_count,
+            "medium_risk_count": medium_risk_count,
+            "low_risk_count": low_risk_count,
+            "deviations": all_deviations,
+            "new_ticket_count": 0,
+        }
+        logger.info(f"批次偏离检测完成: {audit_batch_id}, {result}")
         return result
 
     @classmethod
@@ -322,6 +386,7 @@ class DeviationDetectionService:
                 permission_code=deviation.permission_code,
                 grant=grant,
                 operator_name=operator_name,
+                audit_batch_id=deviation.audit_batch_id,
             )
 
             if not success:

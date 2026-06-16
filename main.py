@@ -9,6 +9,7 @@ from app.routes.sync_routes import router as sync_router
 from app.routes.ticket_routes import router as ticket_router
 from app.routes.audit_routes import router as audit_router
 from app.routes.report_routes import router as report_router
+from app.routes.audit_batch_routes import router as audit_batch_router
 from app.utils import logger
 from app.services import SchedulerService, CRUDService
 from app.models import *
@@ -114,6 +115,7 @@ def create_app() -> FastAPI:
     app.include_router(ticket_router)
     app.include_router(audit_router)
     app.include_router(report_router)
+    app.include_router(audit_batch_router)
 
     return app
 

@@ -18,13 +18,20 @@ class TicketService:
     def auto_generate_tickets(
         cls,
         db: Session,
+        audit_batch_id: Optional[int] = None,
+        deviation_ids: Optional[List[int]] = None,
     ) -> List[AuditTicket]:
-        high_risk_deviations = db.query(PermissionDeviation).filter(
+        query = db.query(PermissionDeviation).filter(
             and_(
                 PermissionDeviation.risk_level == "high",
                 PermissionDeviation.status == "pending",
             )
-        ).all()
+        )
+
+        if deviation_ids:
+            query = query.filter(PermissionDeviation.id.in_(deviation_ids))
+
+        high_risk_deviations = query.all()
 
         tickets = []
         for deviation in high_risk_deviations:
@@ -34,11 +41,13 @@ class TicketService:
             if existing_ticket:
                 continue
 
-            ticket = cls.create_ticket_for_deviation(db, deviation)
+            ticket = cls.create_ticket_for_deviation(
+                db, deviation, audit_batch_id=audit_batch_id
+            )
             if ticket:
                 tickets.append(ticket)
 
-        logger.info(f"自动生成审计工单: {len(tickets)}个")
+        logger.info(f"自动生成审计工单: {len(tickets)}个，audit_batch_id={audit_batch_id}")
         return tickets
 
     @classmethod
@@ -46,6 +55,7 @@ class TicketService:
         cls,
         db: Session,
         deviation: PermissionDeviation,
+        audit_batch_id: Optional[int] = None,
     ) -> Optional[AuditTicket]:
         try:
             user = db.query(User).get(deviation.user_id)
@@ -70,6 +80,7 @@ class TicketService:
                 assignee_id=assignee.id if assignee else None,
                 priority=priority,
                 escalated=False,
+                audit_batch_id=audit_batch_id,
                 created_at=datetime.now(),
                 updated_at=datetime.now(),
             )

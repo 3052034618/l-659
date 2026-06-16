@@ -12,6 +12,7 @@ from app.services.business_system_adapter import (
     AdapterFactory,
     get_business_system_adapter,
 )
+from app.services.audit_batch_service import AuditBatchService
 
 __all__ = [
     "SnapshotSyncService",
@@ -27,4 +28,5 @@ __all__ = [
     "MockBusinessSystemAdapter",
     "AdapterFactory",
     "get_business_system_adapter",
+    "AuditBatchService",
 ]

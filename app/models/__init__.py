@@ -66,10 +66,14 @@ class PermissionSnapshot(Base):
     permissions = Column(JSON, nullable=False)
     sync_source = Column(String(200), nullable=True)
     is_processed = Column(Boolean, default=False)
+    sync_status = Column(String(20), default="success")
+    skip_reason = Column(String(500), nullable=True)
+    audit_batch_id = Column(Integer, ForeignKey("special_audits.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.now)
 
     user = relationship("User", back_populates="snapshots")
     deviations = relationship("PermissionDeviation", back_populates="snapshot", cascade="all, delete-orphan")
+    audit_batch = relationship("SpecialAudit", back_populates="snapshots")
 
 
 class PermissionDeviation(Base):
@@ -90,12 +94,14 @@ class PermissionDeviation(Base):
     description = Column(Text, nullable=True)
     resolved_at = Column(DateTime, nullable=True)
     resolved_action = Column(String(50), nullable=True)
+    audit_batch_id = Column(Integer, ForeignKey("special_audits.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
     user = relationship("User", back_populates="deviations", foreign_keys=[user_id])
     snapshot = relationship("PermissionSnapshot", back_populates="deviations")
     ticket = relationship("AuditTicket", back_populates="deviation", uselist=False, cascade="all, delete-orphan")
+    audit_batch = relationship("SpecialAudit", back_populates="deviations")
 
 
 class AuditTicket(Base):
@@ -116,11 +122,13 @@ class AuditTicket(Base):
     action_type = Column(String(50), nullable=True)
     resolved_at = Column(DateTime, nullable=True)
     resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    audit_batch_id = Column(Integer, ForeignKey("special_audits.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
     deviation = relationship("PermissionDeviation", back_populates="ticket")
     assignee = relationship("User", back_populates="tickets_assigned", foreign_keys=[assignee_id])
+    audit_batch = relationship("SpecialAudit", back_populates="tickets")
 
 
 class PermissionChangeHistory(Base):
@@ -136,7 +144,10 @@ class PermissionChangeHistory(Base):
     operator = Column(String(100), nullable=True)
     change_reason = Column(Text, nullable=True)
     source = Column(String(100), nullable=True)
+    audit_batch_id = Column(Integer, ForeignKey("special_audits.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.now, index=True)
+
+    audit_batch = relationship("SpecialAudit", back_populates="change_histories")
 
 
 class AuditLog(Base):
@@ -181,6 +192,7 @@ class SpecialAudit(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     audit_no = Column(String(50), unique=True, nullable=False)
+    batch_no = Column(String(50), unique=True, nullable=False, index=True)
     title = Column(String(500), nullable=False)
     audit_type = Column(String(50), default="manual")
     target_user_ids = Column(JSON, nullable=True)
@@ -191,3 +203,8 @@ class SpecialAudit(Base):
     started_at = Column(DateTime, default=datetime.now)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
+
+    snapshots = relationship("PermissionSnapshot", back_populates="audit_batch")
+    deviations = relationship("PermissionDeviation", back_populates="audit_batch")
+    tickets = relationship("AuditTicket", back_populates="audit_batch")
+    change_histories = relationship("PermissionChangeHistory", back_populates="audit_batch")

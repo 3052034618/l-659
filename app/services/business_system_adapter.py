@@ -152,6 +152,7 @@ class MockBusinessSystemAdapter(BusinessSystemAdapter):
     def __init__(self):
         self.use_random_permissions = False
         self.should_fail = False
+        self._fail_systems: List[str] = []
         self.fixed_permissions: Dict[str, Dict[str, bool]] = {}
         self.adjust_should_fail = False
         self.adjust_fail_system: Optional[str] = None
@@ -168,7 +169,11 @@ class MockBusinessSystemAdapter(BusinessSystemAdapter):
 
     def set_should_fail(self, fail: bool, system_code: Optional[str] = None):
         self.should_fail = fail
-        self._fail_system = system_code
+        if not fail:
+            self._fail_systems = []
+        elif system_code is not None:
+            if system_code not in self._fail_systems:
+                self._fail_systems.append(system_code)
         status = "启用" if fail else "禁用"
         target = f"[{system_code}]" if system_code else "全局"
         logger.info(f"Mock适配器{target}接口失败模拟已{status}")
@@ -183,7 +188,7 @@ class MockBusinessSystemAdapter(BusinessSystemAdapter):
         logger.info(f"Mock适配器{target}权限调整失败模拟已{status}")
 
     def fetch_permissions(self, user_identifier: str, system_code: str) -> Tuple[bool, Optional[Dict[str, bool]], str]:
-        if self.should_fail and (self._fail_system is None or self._fail_system == system_code):
+        if self.should_fail and (len(self._fail_systems) == 0 or system_code in self._fail_systems):
             from app.utils import get_system_name
             sys_name = get_system_name(system_code)
             return False, None, (
